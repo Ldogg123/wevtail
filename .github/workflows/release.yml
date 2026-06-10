@@ -1,0 +1,95 @@
+name: release
+
+# Build the MSI + portable zip and publish them to a GitHub Release whenever a
+# version tag (e.g. v0.1.0) is pushed.
+on:
+  push:
+    tags:
+      - "v*"
+
+# Creating a Release and uploading assets needs write access to contents; the
+# default GITHUB_TOKEN is read-only otherwise. Scope it at the job for least privilege.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & publish (Windows x64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        # windows-latest already defaults to PowerShell; be explicit so a runner
+        # default shift can't silently change the shell out from under us.
+        shell: pwsh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Single source of truth for the version: Cargo.toml. Fail loudly if the
+      # pushed tag doesn't match it, so release assets can never be mislabeled.
+      - name: Resolve and verify version
+        id: ver
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $tag = "${{ github.ref_name }}"
+          if ("v$version" -ne $tag) {
+            Write-Error "Tag '$tag' does not match Cargo.toml version '$version' (expected 'v$version'). Bump Cargo.toml or retag."
+            exit 1
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Releasing wevtail $version"
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      # The windows-latest image already ships WiX Toolset v3.14.1 (candle/light),
+      # which cargo-wix 0.3.x targets by default — so no separate WiX install step.
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version "^0.3" --locked
+
+      # Build the MSI from the committed wix/main.wxs (do NOT run `cargo wix init`
+      # in CI — that would regenerate the UpgradeCode/PATH GUIDs and break upgrades).
+      # --no-build reuses the binary compiled above. Output: target\wix\wevtail-<ver>-x86_64.msi
+      - name: Build MSI
+        run: cargo wix --no-build --nocapture
+
+      # Assemble the portable zip: the exe plus README and both license files.
+      - name: Stage portable payload
+        id: stage
+        run: |
+          $name = "wevtail-${{ steps.ver.outputs.version }}-x86_64-pc-windows-msvc"
+          $stage = "dist/$name"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/release/wevtail.exe" $stage
+          Copy-Item "README.md" $stage
+          foreach ($f in @("LICENSE-MIT", "LICENSE-APACHE")) {
+            if (Test-Path $f) { Copy-Item $f $stage }
+          }
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/$name.zip" -Force
+
+      # Collect the MSI alongside the zip and emit SHA-256 checksums (sha256sum -c format).
+      - name: Collect artifacts and checksums
+        run: |
+          Copy-Item (Get-ChildItem "target/wix/*.msi" | Select-Object -First 1).FullName "dist/"
+          Get-ChildItem "dist/*.msi", "dist/*.zip" | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)"
+          } | Out-File -FilePath "dist/SHA256SUMS.txt" -Encoding ascii
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: wevtail ${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.msi
+            dist/*.zip
+            dist/SHA256SUMS.txt
